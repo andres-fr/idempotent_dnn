@@ -26,15 +26,17 @@ Download PASCAL VOC 2012 segmentation dataset and decompress into `./datasets/pa
 Dataset is downloaded in [supervisely format](https://developer.supervisely.com/getting-started/python-sdk-tutorials/common/iterate-over-a-local-project). The following script can be run to verify the installation. It should produce a plot with an image and its segmentations:
 
 ```
-python 00a_verify_pascal.py
+python 00a_examine_pascal_dataset.py
 ```
+
+### Running pretrained FCN segmentation model:
 
 ### Training a basic segmentation model:
 
 The following script should initialize a baseline model and train it on image segmentation:
 
 ```
-python 01a_train_baseline.py
+python 01a_run_pretrained_pascal_fcn.py
 ```
 
 
