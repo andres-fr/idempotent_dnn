@@ -108,7 +108,7 @@ def block_circulant(*matrices):
     result = torch.empty((c * h, c * w), dtype=dtypes[0], device=devices[0])
     for i in range(c):
         for j in range(c):
-            mat_idx = j - i
+            mat_idx = (i - j) % c  # j - i
             beg_h, beg_w = i * h, j * w
             result[beg_h : beg_h + h, beg_w : beg_w + w] = matrices[mat_idx]
     #
@@ -135,22 +135,21 @@ if __name__ == "__main__":
     # # (p2 @ (p1 @ v1)).norm()
 
     num_blocks, chans = 3, 10
-    circ = block_circulant(
-        *(
-            gaussian_projector(
-                chans,
-                chans // 2,
-                orth=True,
-                seed=10000 + i,
-                dtype=DTYPE,
-                device=DEVICE,
-            )[0]
-            # gaussian_noise(
-            #     (chans, chans), seed=10000 + i, dtype=DTYPE, device=DEVICE
-            # )
-            for i in range(num_blocks)
-        )
+    blocks = list(
+        gaussian_projector(
+            chans,
+            chans // 2,
+            orth=True,
+            seed=10000 + i,
+            dtype=DTYPE,
+            device=DEVICE,
+        )[0]
+        # gaussian_noise(
+        #     (chans, chans), seed=10000 + i, dtype=DTYPE, device=DEVICE
+        # )
+        for i in range(num_blocks)
     )
+    circ = block_circulant(*blocks)
     vv = gaussian_noise(
         num_blocks * chans, seed=12345, dtype=DTYPE, device=DEVICE
     )
@@ -158,6 +157,38 @@ if __name__ == "__main__":
     # torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho") * torch.fft.fft(vv, norm="ortho")) , norm="ortho")
 
     # ww2 = torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho").conj() * torch.fft.fft(vv)), norm="ortho" ).real
+
+    # GPT APPROACH
+
+    # A = circ[:chans].reshape(chans, chans, -1).permute(-1, 0, 1)
+    A = torch.stack(blocks, dim=0)
+    v = vv.reshape(chans, -1).permute(-1, 0)
+    A_f = torch.fft.fft(A, n=num_blocks, dim=0)  # shape (n, m, m)
+    v_f = torch.fft.fft(v, n=num_blocks, dim=0)  # shape (n, m)
+    y_f = torch.einsum("nij,nj->ni", A_f, v_f)  # shape (n, m)
+    y_blocks = torch.fft.ifft(y_f, n=num_blocks, dim=0)  # shape (n, m)
+    # flatten back to vector
+    y_fft = y_blocks.reshape(num_blocks * chans).real
+    #
+    #
+    #
+    T = torch.zeros((num_blocks * chans, num_blocks * chans), dtype=A.dtype)
+    for i in range(num_blocks):
+        for j in range(num_blocks):
+            block_idx = (i - j) % num_blocks
+            T[
+                i * chans : (i + 1) * chans, j * chans : (j + 1) * chans
+            ] = blocks[block_idx]
+    breakpoint()
+    y_direct = T @ v
+
+    breakpoint()
+
+    ff1 = torch.fft.fft(
+        circ[:chans].reshape(chans, chans, -1), norm="ortho"
+    )  # (10, 10, 3)
+    ff2 = torch.fft.fft(vv.reshape(chans, -1))
+    breakpoint()
 
     circ[:chans].reshape(chans, chans, -1)
 
