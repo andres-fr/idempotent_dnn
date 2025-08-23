@@ -13,6 +13,14 @@ TODO:
 
 Doesn't work, because this operation admits N vectors and spits only 1.
 So we would need some sort of symmetry, running it N times but then data extends to the margins...
+
+
+For 1d multichan conv:
+
+1. Run the regular torch layer and our custom impl as block-circulant with padding. Should be same
+2. then, diagonalize block-circulant via ifft: should become block-diag
+3.
+
 """
 
 
@@ -87,21 +95,78 @@ def mutually_orthogonal_projectors(
     return projectors, basis
 
 
+def block_circulant(*matrices):
+    """ """
+    shapes, dtypes, devices = zip(
+        *((m.shape, m.dtype, m.device) for m in matrices)
+    )
+    if (len(set(shapes)), len(set(dtypes)), len(set(devices))) != (1, 1, 1):
+        raise ValueError("All matrices must be of same shape/dtype/device!")
+    h, w = shapes[0]
+    c = len(matrices)
+    #
+    result = torch.empty((c * h, c * w), dtype=dtypes[0], device=devices[0])
+    for i in range(c):
+        for j in range(c):
+            mat_idx = j - i
+            beg_h, beg_w = i * h, j * w
+            result[beg_h : beg_h + h, beg_w : beg_w + w] = matrices[mat_idx]
+    #
+    return result
+
+
 # ##############################################################################
 # # MAIN ROUTINE
 # ##############################################################################
 if __name__ == "__main__":
+    DTYPE, DEVICE = torch.float64, "cpu"
     # p1, _ = gaussian_projector(20, 5, orth=True, seed=12345)
 
-    (p1, p2, p3, p4), _ = mutually_orthogonal_projectors(
-        20, (5, 5, 5, 5), seed=12345
-    )
-    v1 = gaussian_noise(20, seed=10000, dtype=torch.float64, device="cpu")
-    v2 = gaussian_noise(20, seed=10001, dtype=torch.float64, device="cpu")
-    v3 = gaussian_noise(20, seed=10002, dtype=torch.float64, device="cpu")
-    v4 = gaussian_noise(20, seed=10003, dtype=torch.float64, device="cpu")
+    # (p1, p2, p3, p4), _ = mutually_orthogonal_projectors(
+    #     20, (5, 5, 5, 5), seed=12345
+    # )
+    # v1 = gaussian_noise(20, seed=10000, dtype=torch.float64, device="cpu")
+    # v2 = gaussian_noise(20, seed=10001, dtype=torch.float64, device="cpu")
+    # v3 = gaussian_noise(20, seed=10002, dtype=torch.float64, device="cpu")
+    # v4 = gaussian_noise(20, seed=10003, dtype=torch.float64, device="cpu")
 
-    ww = (p1 @ v1) + (p2 @ v2) + (p3 @ v3) + (p4 @ v4)
-    # torch.dist(p1 @ v1, p1 @ (p1 @ v1))
-    # (p2 @ (p1 @ v1)).norm()
+    # ww = (p1 @ v1) + (p2 @ v2) + (p3 @ v3) + (p4 @ v4)
+    # # torch.dist(p1 @ v1, p1 @ (p1 @ v1))
+    # # (p2 @ (p1 @ v1)).norm()
+
+    num_blocks, chans = 3, 10
+    circ = block_circulant(
+        *(
+            gaussian_projector(
+                chans,
+                chans // 2,
+                orth=True,
+                seed=10000 + i,
+                dtype=DTYPE,
+                device=DEVICE,
+            )[0]
+            # gaussian_noise(
+            #     (chans, chans), seed=10000 + i, dtype=DTYPE, device=DEVICE
+            # )
+            for i in range(num_blocks)
+        )
+    )
+    vv = gaussian_noise(
+        num_blocks * chans, seed=12345, dtype=DTYPE, device=DEVICE
+    )
+    ww = circ @ vv
+    # torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho") * torch.fft.fft(vv, norm="ortho")) , norm="ortho")
+
+    # ww2 = torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho").conj() * torch.fft.fft(vv)), norm="ortho" ).real
+
+    circ[:chans].reshape(chans, chans, -1)
+
+    ff1 = torch.fft.fft(circ[:chans].reshape(chans, chans, -1), norm="ortho")
+    ff2 = torch.fft.fft(vv.reshape(chans, -1))
+    mm = (ff1.permute(-1, 0, 1) @ ff2.permute(-1, 0).unsqueeze(-1)).squeeze(-1)
+
+    breakpoint()
+
+    # ppp, _ = gaussian_projector(chans, chans // 2, orth=True, seed=123, dtype=DTYPE, device=DEVICE)
+
     breakpoint()
