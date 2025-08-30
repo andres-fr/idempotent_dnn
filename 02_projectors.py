@@ -5,21 +5,14 @@
 """
 TODO:
 
-1. given a seed and a desired rank, create a random projector. Also bool for orth
+1. Now we have multichan conv, compare to torch.
+  - Check: torch conv should work same
+  - Goal: create a FftConv layer where we can specify the OrthProj freq response
+  - Bonus: translate to regular conv. How?
 
-2. For conv, if we have c_in -> c_out channels and a h*w kernel, we need to
-   generate h*w projectors of shape (c_out, c_in), all of them orthogonal to each other.
-3. Then, the operation P1@x1 + P2@x2 + ... is idempotent.
+2. Check that applying this conv several times results in same as once
 
-Doesn't work, because this operation admits N vectors and spits only 1.
-So we would need some sort of symmetry, running it N times but then data extends to the margins...
-
-
-For 1d multichan conv:
-
-1. Run the regular torch layer and our custom impl as block-circulant with padding. Should be same
-2. then, diagonalize block-circulant via ifft: should become block-diag
-3.
+3. Use it to train sth, extend to 2d.
 
 """
 
@@ -115,6 +108,47 @@ def block_circulant(*matrices):
     return result
 
 
+def circorr(x, y, real=True):
+    """ """
+    x_fft = torch.fft.fft(x, norm="ortho")
+    y_fft = torch.fft.fft(y)
+    result = torch.fft.ifft((x_fft.conj() * y_fft), norm="ortho")
+    result = result.real if real else result
+    return result
+
+
+def circorr_fft(x, kernel):
+    """
+    :param x: Tensor of shape ``(chans_in, n)``
+    :param kernel: Tensor of shape ``(chans_out, chans_in, n)``
+    :returns: Tensor of shape ``(chans_out, n)``, as the circular correlation
+      between ``kernel`` and ``x``.
+
+    Consider the case where ``n==1``. Here, the kernel is a matrix that
+    projects from ``chans_in`` to ``chans_out``. For larger ``n``, we have
+    ``n`` linear projections, and the results are added.
+    But since this is circulant, this project-and-add operation is also
+    performed ``n`` times, in a rolling fashion. This is equivalent to
+    building a block-circulant matrix of shape ``(chans_out*n, chans_in*n)``
+    and performing a matrix-vector multiplication with flattened ``x``.
+
+    Now, in the FFT version, this turns out to diagonalize to an elementwise
+    multiplication between each ``fft(kernel[i, j])`` and ``fft(x[j])``, added
+    over all j (which is asymptotically much cheaper).
+    """
+    ch_out, ch_in, n = kernel.shape
+    if x.shape != (ch_in, n):
+        raise ValueError(
+            f"Incompatible kernel and input shapes! {kernel.shape, x.shape}"
+        )
+    #
+    kernel_f = torch.fft.fft(kernel, norm="ortho")  # (ch_out, ch_in, n)
+    x_f = torch.fft.fft(x)  # (ch_in, n)
+    result = (kernel_f * x_f.unsqueeze(0).conj()).sum(1).conj()  # (ch_out, n)
+    result = torch.fft.ifft(result, norm="ortho")
+    return result
+
+
 # ##############################################################################
 # # MAIN ROUTINE
 # ##############################################################################
@@ -138,7 +172,7 @@ if __name__ == "__main__":
     blocks = list(
         gaussian_projector(
             chans,
-            chans // 2,
+            max(1, chans // 2),
             orth=True,
             seed=10000 + i,
             dtype=DTYPE,
@@ -157,6 +191,30 @@ if __name__ == "__main__":
     # torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho") * torch.fft.fft(vv, norm="ortho")) , norm="ortho")
 
     # ww2 = torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho").conj() * torch.fft.fft(vv)), norm="ortho" ).real
+
+    # so this yields a num_blocks-dimensional vector, indexed by i/j
+    # this is the thing that we circ-convolve with the j-th input chan, to
+    # produce the i-th output chan.
+    # circ[:10].reshape(10, 3, 10).permute(0, 2, 1)[0,  0]
+
+    # so let's fix i/j, and compare the fft conv on the vec with the block:
+    # as we can see, the sum of circorrs over j corresponds indeed to the i-th
+    # output channel when doing the full matmul (ww):
+    kernel = circ[:10].reshape(10, 3, 10).permute(0, 2, 1)
+    vv_chans = vv.reshape(3, 10).H
+    ww2 = circorr_fft(vv_chans, kernel).real.T.flatten()
+    breakpoint()
+
+    """
+    NICE: we got the 1D FFT conv for multichannel.
+    """
+    # and the output chan i is the sum over all j:
+
+    # at this point, conv_ij is correct
+
+    # circ[:10].reshape(10, 3, 10)[0, :, 0]
+    # NEW: CIRC FFT BLOCKCONV?
+    breakpoint()
 
     # GPT APPROACH
 
