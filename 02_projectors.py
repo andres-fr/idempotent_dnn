@@ -88,65 +88,189 @@ def mutually_orthogonal_projectors(
     return projectors, basis
 
 
-def block_circulant(*matrices):
-    """ """
-    shapes, dtypes, devices = zip(
-        *((m.shape, m.dtype, m.device) for m in matrices)
-    )
-    if (len(set(shapes)), len(set(dtypes)), len(set(devices))) != (1, 1, 1):
-        raise ValueError("All matrices must be of same shape/dtype/device!")
-    h, w = shapes[0]
-    c = len(matrices)
-    #
-    result = torch.empty((c * h, c * w), dtype=dtypes[0], device=devices[0])
-    for i in range(c):
-        for j in range(c):
-            mat_idx = (i - j) % c  # j - i
-            beg_h, beg_w = i * h, j * w
-            result[beg_h : beg_h + h, beg_w : beg_w + w] = matrices[mat_idx]
-    #
-    return result
+class CircularCorrelation:
+    """Block-circulant and FFT correlation.
 
+    This class implements 1D and 2D multi-channel circulant correlation (a.k.a.
+    convolution in deep learning) via linear operators (either block-circulant
+    or BCCB), as well as via FFT.
 
-def circorr(x, y, real=True):
-    """ """
-    x_fft = torch.fft.fft(x, norm="ortho")
-    y_fft = torch.fft.fft(y)
-    result = torch.fft.ifft((x_fft.conj() * y_fft), norm="ortho")
-    result = result.real if real else result
-    return result
-
-
-def circorr_fft(x, kernel):
+    The FFT implementation yields same results up to numerical precision.
     """
-    :param x: Tensor of shape ``(chans_in, n)``
-    :param kernel: Tensor of shape ``(chans_out, chans_in, n)``
-    :returns: Tensor of shape ``(chans_out, n)``, as the circular correlation
-      between ``kernel`` and ``x``.
 
-    Consider the case where ``n==1``. Here, the kernel is a matrix that
-    projects from ``chans_in`` to ``chans_out``. For larger ``n``, we have
-    ``n`` linear projections, and the results are added.
-    But since this is circulant, this project-and-add operation is also
-    performed ``n`` times, in a rolling fashion. This is equivalent to
-    building a block-circulant matrix of shape ``(chans_out*n, chans_in*n)``
-    and performing a matrix-vector multiplication with flattened ``x``.
+    @staticmethod
+    def circulant1d(*matrices):
+        """Builds a circulant matrix from a row of matrices.
 
-    Now, in the FFT version, this turns out to diagonalize to an elementwise
-    multiplication between each ``fft(kernel[i, j])`` and ``fft(x[j])``, added
-    over all j (which is asymptotically much cheaper).
-    """
-    ch_out, ch_in, n = kernel.shape
-    if x.shape != (ch_in, n):
-        raise ValueError(
-            f"Incompatible kernel and input shapes! {kernel.shape, x.shape}"
+        :param matrices: Collection of ``n`` matrices, each of shape
+          ``(out_dims, in_dims)``.
+        :returns: A matrix of shape ``(n*out_dims, n*in_dims)``, where each
+          ``(i, j)`` block contains ``matrices[j - i]``.
+        """
+        shapes, dtypes, devices = zip(
+            *((m.shape, m.dtype, m.device) for m in matrices)
         )
-    #
-    kernel_f = torch.fft.fft(kernel, norm="ortho")  # (ch_out, ch_in, n)
-    x_f = torch.fft.fft(x)  # (ch_in, n)
-    result = (kernel_f * x_f.unsqueeze(0).conj()).sum(1).conj()  # (ch_out, n)
-    result = torch.fft.ifft(result, norm="ortho")
-    return result
+        if (len(set(shapes)), len(set(dtypes)), len(set(devices))) != (
+            1,
+            1,
+            1,
+        ):
+            raise ValueError(
+                "All matrices must be of same shape/dtype/device!"
+            )
+        h, w = shapes[0]
+        c = len(matrices)
+        #
+        result = torch.empty(
+            (c * h, c * w), dtype=dtypes[0], device=devices[0]
+        )
+        for i in range(c):
+            for j in range(c):
+                mat_idx = j - i
+                beg_h, beg_w = i * h, j * w
+                result[beg_h : beg_h + h, beg_w : beg_w + w] = matrices[
+                    mat_idx
+                ]
+        #
+        return result
+
+    @classmethod
+    def circorr1d(cls, x, kernel):
+        """1D circular correlation.
+
+        :param x: Tensor of shape ``(chans_in, n)``
+        :param kernel: Tensor of shape ``(chans_out, chans_in, n)``
+        :returns: Tensor of shape ``(chans_out, n)``, as the circular
+          correlation between ``kernel`` and ``x``.
+
+        Consider the case where ``n==1``: the kernel is a matrix that
+        projects from ``chans_in`` to ``chans_out``. For larger ``n``, we have
+        ``n`` linear projections, and the results are added.
+        But since this is circulant, this project-and-add operation is also
+        performed ``n`` times, in a rolling fashion. This is equivalent to
+        building a block-circulant matrix of shape ``(chans_out*n, chans_in*n)``
+        and performing a matrix-vector multiplication with flattened ``x``.
+        Then, the output is reshaped to ``(chans_out, n)``, where each ``n``
+        corresponds to one rolling position.
+        """
+        ch_out, ch_in, n = kernel.shape
+        if x.shape != (ch_in, n):
+            raise ValueError(
+                f"Incompatible kernel and input shapes {kernel.shape, x.shape}"
+            )
+        #
+        blocks = [kernel[:, :, i] for i in range(n)]
+        circ = cls.circulant1d(*blocks)
+        xflat = x.H.flatten()
+        result = circ @ x.H.flatten()
+        result = result.reshape(n, ch_out).H
+        return result
+
+    @classmethod
+    def circorr1d_fft(cls, x, kernel):
+        """FFT implementation of 1D circular correlation.
+
+        In the FFT version, this operation diagonalizes to an elementwise
+        multiplication between each ``fft(kernel[i, j])`` and ``fft(x[j])``,
+        added over all j (which is asymptotically much cheaper). Note that
+        instead of performing inverse FFT and adding over all input channels,
+        we can first add the elementwise multiplications and then perform
+        a single iFFT.
+        """
+        ch_out, ch_in, n = kernel.shape
+        if x.shape != (ch_in, n):
+            raise ValueError(
+                f"Incompatible kernel and input shapes! {kernel.shape, x.shape}"
+            )
+        #
+        kernel_f = torch.fft.fft(kernel)  # (ch_out, ch_in, n)
+        x_f = torch.fft.fft(x, norm="ortho")  # (ch_in, n)
+        result = (
+            (kernel_f * x_f.unsqueeze(0).conj()).sum(1).conj()
+        )  # (ch_out, n)
+        result = torch.fft.ifft(result, norm="ortho")
+        return result
+
+    @classmethod
+    def circulant2d(cls, kernel):
+        """Builds a BCCB matrix from a row of circulant blocks.
+
+        :param kernel: circorr2d parameters as tensor of shape
+          ``(out, in, H, W)``.
+        :returns: A matrix of shape ``(H*W*out, H*W*in)``, where each
+          ``(hi, hj)`` block is a W-by-W circulant matrix corresponding to
+          the multichannel circorr1d between the i-th kernel and the j-th
+          input rows.
+
+        Recall that multichannel 1D convolution amounts to a block-circulant
+        linear operation. In the 2D setting, we flatten the input in a per-row
+        basis, so we have ``H`` segments, each with ``W`` vectors of ``in``
+        dimensions. The output will follow the exact same structure, but with
+        ``H->W->out``blocks instead.
+
+        Then, each one of the H-by-H main segments is a W-by-W block circulant
+        matrix, corresponding to the circulant1d between the corresponding row
+        of kernel and input.
+
+        So, to construct this matrix, we first generate the ``H``
+        block-circulant matrices, by picking the ``W`` segments of a given
+        kernel row, and arranging them on a W-by-W circulant fashion.
+        Doing this for each row yields the ``H`` elements that are used this
+        time to build the block-circulant-with-circulant-blocks (BCCB) matrix.
+        """
+        ch_out, ch_in, H, W = kernel.shape
+        #
+        row_circs = []
+        for h in range(H):
+            row_blocks = kernel[:, :, h, :].permute(2, 0, 1)  # (W, out, in)
+            row_circ = cls.circulant1d(*row_blocks)  # (W*out, W*in)
+            row_circs.append(row_circ)
+        #
+        result = cls.circulant1d(*row_circs)
+        return result
+
+    @classmethod
+    def circorr2d(cls, x, kernel):
+        """2D circular correlation.
+
+        :param x: Tensor of shape ``(chans_in, H, W)``
+        :param kernel: Tensor of shape ``(chans_out, chans_in, H, W)``
+        :returns: Tensor of shape ``(chans_out, H, W)``, as the circular
+          correlation between ``kernel`` and ``x``.
+        """
+        ch_out, ch_in, H, W = kernel.shape
+        if x.shape != (ch_in, H, W):
+            raise ValueError(
+                f"Incompatible kernel and input shapes {kernel.shape, x.shape}"
+            )
+        bccb = cls.circulant2d(kernel)  # (H*W*out, H*W*in)
+        result = bccb @ x.reshape(ch_in, H * W).H.flatten()
+        result = result.reshape(H, W, -1).permute(2, 0, 1)  # (out, H, W)
+        return result
+
+    @classmethod
+    def circorr2d_fft(cls, x, kernel):
+        """FFT implementation of 2D circular correlation.
+
+        :param x: Tensor of shape (chans_in, H, W)
+        :param kernel: Tensor of shape (chans_out, chans_in, H, W)
+        :returns: Tensor of shape (chans_out, H, W)
+        """
+        ch_out, ch_in, H, W = kernel.shape
+        if x.shape != (ch_in, H, W):
+            raise ValueError(
+                f"Incompatible kernel and input shapes {kernel.shape, x.shape}"
+            )
+        #
+        kernel_f = torch.fft.fft2(kernel, dim=(-2, -1))  # (out, in, H, W)
+        x_f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # (in, H, W)
+        result = (
+            (kernel_f * x_f.unsqueeze(0).conj()).sum(1).conj()
+        )  # (out, h, w)
+        result = torch.fft.ifft2(
+            result, dim=(-2, -1), norm="ortho"
+        )  # (out, h, w)
+        return result
 
 
 # ##############################################################################
@@ -168,94 +292,44 @@ if __name__ == "__main__":
     # # torch.dist(p1 @ v1, p1 @ (p1 @ v1))
     # # (p2 @ (p1 @ v1)).norm()
 
-    num_blocks, chans = 3, 10
+    num_blocks, in_chans, out_chans = 3, 11, 5
     blocks = list(
-        gaussian_projector(
-            chans,
-            max(1, chans // 2),
-            orth=True,
-            seed=10000 + i,
-            dtype=DTYPE,
-            device=DEVICE,
-        )[0]
-        # gaussian_noise(
-        #     (chans, chans), seed=10000 + i, dtype=DTYPE, device=DEVICE
-        # )
+        # gaussian_projector(
+        #     chans,
+        #     max(1, chans // 2),
+        #     orth=True,
+        #     seed=10000 + i,
+        #     dtype=DTYPE,
+        #     device=DEVICE,
+        # )[0]
+        gaussian_noise(
+            (out_chans, in_chans), seed=10000 + i, dtype=DTYPE, device=DEVICE
+        )
         for i in range(num_blocks)
     )
-    circ = block_circulant(*blocks)
-    vv = gaussian_noise(
-        num_blocks * chans, seed=12345, dtype=DTYPE, device=DEVICE
+    kernel = (
+        torch.hstack(blocks)
+        .reshape(out_chans, num_blocks, in_chans)
+        .permute(0, 2, 1)
     )
-    ww = circ @ vv
-    # torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho") * torch.fft.fft(vv, norm="ortho")) , norm="ortho")
+    x = gaussian_noise(
+        (in_chans, num_blocks), seed=12345, dtype=DTYPE, device=DEVICE
+    )
+    y1 = Conv1dPrototype.circorr1d(x, kernel)
+    y2 = Conv1dPrototype.circorr1d_fft(x, kernel).real
 
-    # ww2 = torch.fft.ifft((torch.fft.fft(circ[0], norm="ortho").conj() * torch.fft.fft(vv)), norm="ortho" ).real
-
-    # so this yields a num_blocks-dimensional vector, indexed by i/j
-    # this is the thing that we circ-convolve with the j-th input chan, to
-    # produce the i-th output chan.
-    # circ[:10].reshape(10, 3, 10).permute(0, 2, 1)[0,  0]
-
-    # so let's fix i/j, and compare the fft conv on the vec with the block:
-    # as we can see, the sum of circorrs over j corresponds indeed to the i-th
-    # output channel when doing the full matmul (ww):
-    kernel = circ[:10].reshape(10, 3, 10).permute(0, 2, 1)
-    vv_chans = vv.reshape(3, 10).H
-    ww2 = circorr_fft(vv_chans, kernel).real.T.flatten()
-    breakpoint()
-
-    """
-    NICE: we got the 1D FFT conv for multichannel.
-    """
-    # and the output chan i is the sum over all j:
-
-    # at this point, conv_ij is correct
-
-    # circ[:10].reshape(10, 3, 10)[0, :, 0]
-    # NEW: CIRC FFT BLOCKCONV?
-    breakpoint()
-
-    # GPT APPROACH
-
-    # A = circ[:chans].reshape(chans, chans, -1).permute(-1, 0, 1)
-    A = torch.stack(blocks, dim=0)
-    v = vv.reshape(chans, -1).permute(-1, 0)
-    A_f = torch.fft.fft(A, n=num_blocks, dim=0)  # shape (n, m, m)
-    v_f = torch.fft.fft(v, n=num_blocks, dim=0)  # shape (n, m)
-    y_f = torch.einsum("nij,nj->ni", A_f, v_f)  # shape (n, m)
-    y_blocks = torch.fft.ifft(y_f, n=num_blocks, dim=0)  # shape (n, m)
-    # flatten back to vector
-    y_fft = y_blocks.reshape(num_blocks * chans).real
     #
     #
     #
-    T = torch.zeros((num_blocks * chans, num_blocks * chans), dtype=A.dtype)
-    for i in range(num_blocks):
-        for j in range(num_blocks):
-            block_idx = (i - j) % num_blocks
-            T[
-                i * chans : (i + 1) * chans, j * chans : (j + 1) * chans
-            ] = blocks[block_idx]
-    breakpoint()
-    y_direct = T @ v
 
-    breakpoint()
+    hh, ww = (13, 17)
 
-    ff1 = torch.fft.fft(
-        circ[:chans].reshape(chans, chans, -1), norm="ortho"
-    )  # (10, 10, 3)
-    ff2 = torch.fft.fft(vv.reshape(chans, -1))
-    breakpoint()
-
-    circ[:chans].reshape(chans, chans, -1)
-
-    ff1 = torch.fft.fft(circ[:chans].reshape(chans, chans, -1), norm="ortho")
-    ff2 = torch.fft.fft(vv.reshape(chans, -1))
-    mm = (ff1.permute(-1, 0, 1) @ ff2.permute(-1, 0).unsqueeze(-1)).squeeze(-1)
-
-    breakpoint()
-
-    # ppp, _ = gaussian_projector(chans, chans // 2, orth=True, seed=123, dtype=DTYPE, device=DEVICE)
-
+    kernel2d = gaussian_noise(
+        (out_chans, in_chans, hh, ww), seed=1234, dtype=DTYPE, device=DEVICE
+    )
+    xx = gaussian_noise(
+        (in_chans, hh, ww), seed=1205, dtype=DTYPE, device=DEVICE
+    )
+    yy1 = Conv1dPrototype.circorr2d(xx, kernel2d)
+    yy2 = Conv1dPrototype.circorr2d_fft(xx, kernel2d)
     breakpoint()
