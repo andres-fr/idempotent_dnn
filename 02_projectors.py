@@ -5,14 +5,25 @@
 """
 TODO:
 
-1. Now we have multichan conv, compare to torch.
-  - Check: torch conv should work same
-  - Goal: create a FftConv layer where we can specify the OrthProj freq response
-  - Bonus: translate to regular conv. How?
+* We have autograd-compatible, correct FFT convs
+* In 02: train a small FFTconv 2D classifier on MNIST (make sure to pad)
+  - So we show that our conv can be used for training
+  - Also train a plain MLP
+* In 03: MLP projector version:
+  - Start with the proj version of the MLP. should be straightfwd
+  - Then add the Cayley and kernel-bias constraints to update. How?
+  - Idempotence should still hold, and should train well
+* In 04: Conv projector version
+  - Figure out how to apply this spectral-proj conv when input has variable length: params should still be in time domain?
+  - Then add Cayley and kernel-bias; should train and be idemp
+* In 05: Move onto larger nets and datasets for segmentation
+  - If it trains and is idempotent, this is itself a success
 
-2. Check that applying this conv several times results in same as once
+If we reach this point, we will have trainable idempotent layers! what now?
 
-3. Use it to train sth, extend to 2d.
+1. Grab trained net and feed testset image: not OOD, but unseen.
+  - wait, this way it can NEVER be inconsistent... or can it? maybe we should use losses? rethink
+
 
 """
 
@@ -30,13 +41,85 @@ from idemp.projectors import gaussian_projector, mutually_orthogonal_projectors
 # ##############################################################################
 # # HELPERS
 # ##############################################################################
+class Circorr1d(torch.nn.Module):
+    """ """
+
+    def __init__(self, ch_in, ch_out, ksize, bias=True):
+        """ """
+        super().__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.ksize = ksize
+        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, ksize))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        """ """
+        b, c_in, n = x.shape
+        if c_in != self.ch_in:
+            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
+        if n < self.ksize:
+            raise ValueError(f"Input must have at least {self.ksize} len!")
+        #
+        k = F.pad(self.kernel, (0, n - self.ksize))
+        #
+        k_f = torch.fft.fft(k, dim=-1)  # (out, in, n)
+        x_f = torch.fft.fft(x, dim=-1, norm="ortho")  # (b, in, n)
+        y = torch.einsum("oik,bik->bok", k_f, x_f.conj()).conj()  # (b, o, n)
+        #
+        y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, out, n)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1)  # (b, out, n)
+        #
+        return y
+
+
+class Circorr2d(torch.nn.Module):
+    """ """
+
+    def __init__(self, ch_in, ch_out, ksize, bias=True):
+        """ """
+        super().__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.ksize = ksize
+        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, *ksize))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        """ """
+        b, c_in, h, w = x.shape
+        if c_in != self.ch_in:
+            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
+        if h < self.ksize[0]:
+            raise ValueError(f"Input must be larger than {self.ksize}!")
+        if w < self.ksize[1]:
+            raise ValueError(f"Input must be larger than {self.ksize}!")
+        #
+        k = F.pad(self.kernel, (0, w - self.ksize[1], 0, h - self.ksize[0]))
+        #
+        k_f = torch.fft.fft2(k, dim=(-2, -1))  # (out, in, H, W)
+        x_f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # (b, in, H, W)
+        y = torch.einsum("ijhw,bjhw->bihw", k_f, x_f.conj()).conj()
+        # (b, o, H, W)
+        y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho").real  # (b, o, H, W)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1, 1)  # (b, out, H, W)
+        #
+        return y
 
 
 # ##############################################################################
 # # MAIN ROUTINE
 # ##############################################################################
 if __name__ == "__main__":
-    DTYPE, DEVICE = torch.float64, "cpu"
+    DTYPE, DEVICE = torch.float32, "cpu"
     # p1, _ = gaussian_projector(20, 5, orth=True, seed=12345)
 
     # (p1, p2, p3, p4), _ = mutually_orthogonal_projectors(
@@ -94,12 +177,6 @@ if __name__ == "__main__":
 
     """
     PLAN:
-    investigate with deltas. plan is to get same behaviour as torch 1d and 2d
-    up to padding etc. Then, leave the prototype as-is and write a conv FFT
-    function with an interface similar to torch for drop-in replacement (batched and kbias)
-
-    Then, also profile the FFT version, which should have minimal memory and
-    runtime while being autodiffable.
 
     At this point, we should be able to train e.g. a small logistic conv
     classifier on MNIST. This should be our 02 script
@@ -138,9 +215,21 @@ if __name__ == "__main__":
     kk = torch.zeros((1, 1, 5, 5), dtype=DTYPE, device=DEVICE)
     kk[0, 0, 2, 2] = 1
     yy = circorr2d_fft(xx, kk).real
-    breakpoint()
 
-    # now pytorch 1d:
-    # F.conv1d(x.unsqueeze(0), k, padding=0)
+    CC1 = Circorr1d(1, 1, 3, bias=True)
+    CC1(x)
 
+    CC2 = Circorr2d(1, 1, (3, 4), bias=True)
+    loss_fn = torch.nn.MSELoss()
+    opt = torch.optim.SGD(
+        CC2.parameters(), lr=1e-5, momentum=0.9, weight_decay=1e-2
+    )
+    for i in range(30000):
+        opt.zero_grad()
+        z = CC2(xx)
+        loss = loss_fn(z, xx)
+        loss.backward()
+        opt.step()
+        if i % 500 == 0:
+            print(i, "loss:", loss)
     breakpoint()
