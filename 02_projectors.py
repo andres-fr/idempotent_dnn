@@ -3,6 +3,13 @@
 
 
 """
+* Tenemos una conv layer que entrena
+* Pero habia la duda del kernel size, que se resuelve con el straight-through
+
+* Implementar el fwd/bwd para 1d y 2d, comprobar que es idempotente y entrenable para recons (al menos deberia converger a identity)
+* Añadirle el bias, y mantener idempotence.
+  - Intentar que entrene en algo dificil y ver q pasa
+
 TODO:
 
 * We have autograd-compatible, correct FFT convs
@@ -35,82 +42,85 @@ import matplotlib.pyplot as plt
 
 from idemp.utils import gaussian_noise
 from idemp.fftconv import circorr1d_fft, circorr2d_fft, CircularCorrelation
+from idemp.fftconv import Circorr1d, Circorr2d
 from idemp.projectors import gaussian_projector, mutually_orthogonal_projectors
 
 
 # ##############################################################################
 # # HELPERS
 # ##############################################################################
-class Circorr1d(torch.nn.Module):
+class ProjStraightThrough(torch.autograd.Function):
     """ """
 
-    def __init__(self, ch_in, ch_out, ksize, bias=True):
+    @staticmethod
+    def forward(ctx, x, rank, saturation=1.0):
+        """
+        :param x: batch of arbitrary square matrices
+        :param saturation: During backward step, eigenvalues are pushed to
+          boolean via softmax. This parameter is the pre-softmax scaling. A
+          larger saturation means closer to boolean: more similarity to a
+          projector (gradients are les biased), but less quality of gradients.
+
+        """
+        b, h, w = x.shape
+        if h != w:
+            raise ValueError(f"Only square matrices supported! {x.shape}")
+        U, S, Vh = torch.linalg.svd(x)
+        S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
+        ctx.save_for_backward(U, S_soft, Vh)
+        # batch-wise outer product for projectors
+        P = torch.matmul(U[..., :rank], U[..., :rank].permute(0, 2, 1).conj())
+        return P, S, S_soft
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        """ """
+        U, S_soft, Vh = ctx.saved_tensors
+        P_soft = (U * S_soft.unsqueeze(1)) @ U.permute(0, 2, 1).conj()
+        grad_in = grad_out @ P_soft + P_soft @ grad_out
+        return grad_in, None, None
+
+
+class IdempotentCircorr1d(torch.nn.Module):
+    """ """
+
+    def __init__(self, chans, ksize, rank, bias=True):
         """ """
         super().__init__()
-        self.ch_in = ch_in
-        self.ch_out = ch_out
+        self.chans = chans
         self.ksize = ksize
-        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, ksize))
+        self.rank = rank
+        self.kernel = torch.nn.Parameter(torch.randn(chans, chans, ksize))
         if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
+            self.bias = torch.nn.Parameter(torch.zeros(chans))
         else:
             self.register_parameter("bias", None)
 
     def forward(self, x):
         """ """
-        b, c_in, n = x.shape
-        if c_in != self.ch_in:
-            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
+        b, c, n = x.shape
+        if c != self.chans:
+            raise ValueError(f"Expected {self.chans} channels, got {c}")
         if n < self.ksize:
             raise ValueError(f"Input must have at least {self.ksize} len!")
         #
         k = F.pad(self.kernel, (0, n - self.ksize))
         #
-        k_f = torch.fft.fft(k, dim=-1)  # (out, in, n)
-        x_f = torch.fft.fft(x, dim=-1, norm="ortho")  # (b, in, n)
-        y = torch.einsum("oik,bik->bok", k_f, x_f.conj()).conj()  # (b, o, n)
+        x_f = torch.fft.fft(x, dim=-1, norm="ortho")  # (b, c, n)
+        k_f = torch.fft.fft(k, dim=-1)  # (c, c, n)
+        #
+        k_f_proj = ProjStraightThrough.apply(  # (c, c, n)
+            k_f.permute(2, 0, 1), self.rank, 1.0
+        )[0].permute(1, 2, 0)
+        #
+        if k_f.numel() < (2 * x_f.numel()):
+            y = torch.einsum("oin,bin->bon", k_f.conj(), x_f)  # (b, out, n)
+        else:
+            y = torch.einsum("oin,bin->bon", k_f, x_f.conj()).conj()
         #
         y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, out, n)
         if self.bias is not None:
             y = y + self.bias.view(1, -1, 1)  # (b, out, n)
-        #
-        return y
-
-
-class Circorr2d(torch.nn.Module):
-    """ """
-
-    def __init__(self, ch_in, ch_out, ksize, bias=True):
-        """ """
-        super().__init__()
-        self.ch_in = ch_in
-        self.ch_out = ch_out
-        self.ksize = ksize
-        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, *ksize))
-        if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
-        else:
-            self.register_parameter("bias", None)
-
-    def forward(self, x):
-        """ """
-        b, c_in, h, w = x.shape
-        if c_in != self.ch_in:
-            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
-        if h < self.ksize[0]:
-            raise ValueError(f"Input must be larger than {self.ksize}!")
-        if w < self.ksize[1]:
-            raise ValueError(f"Input must be larger than {self.ksize}!")
-        #
-        k = F.pad(self.kernel, (0, w - self.ksize[1], 0, h - self.ksize[0]))
-        #
-        k_f = torch.fft.fft2(k, dim=(-2, -1))  # (out, in, H, W)
-        x_f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # (b, in, H, W)
-        y = torch.einsum("ijhw,bjhw->bihw", k_f, x_f.conj()).conj()
-        # (b, o, H, W)
-        y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho").real  # (b, o, H, W)
-        if self.bias is not None:
-            y = y + self.bias.view(1, -1, 1, 1)  # (b, out, H, W)
         #
         return y
 
@@ -159,6 +169,16 @@ if __name__ == "__main__":
     )
     y1 = CircularCorrelation.circorr1d(x, kernel)
     y2 = CircularCorrelation.circorr1d_fft(x, kernel).real
+
+    cc1d = Circorr1d(11, 5, 3, bias=False)
+    cc1d.kernel.data[:] = kernel
+    cc1d(x.unsqueeze(0))
+
+    quack = IdempotentCircorr1d(11, 3, 5, bias=False)
+    yy1 = quack(x.unsqueeze(0))
+    yy2 = quack(yy1)
+    yy3 = quack(yy2)
+    breakpoint()
 
     #
     #

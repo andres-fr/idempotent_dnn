@@ -5,10 +5,11 @@
 """ """
 
 import torch
+import torch.nn.functional as F
 
 
 # ##############################################################################
-# # FFT BATCHED CIRCULAR CORRELATION
+# # FFT BATCHED CIRCULAR CORRELATION (FUNCTIONS AND TORCH MODULES)
 # ##############################################################################
 def circorr1d_fft(x, kernel):
     """FFT batched 1D circular correlation.
@@ -50,6 +51,85 @@ def circorr2d_fft(x, kernel):
     y = torch.einsum("ijhw,bjhw->bihw", k_f, x_f.conj()).conj()  # (b, o, H, W)
     y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho")  # (b, out, H, W)
     return y
+
+
+class Circorr1d(torch.nn.Module):
+    """ """
+
+    def __init__(self, ch_in, ch_out, ksize, bias=True):
+        """ """
+        super().__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.ksize = ksize
+        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, ksize))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        """ """
+        b, c_in, n = x.shape
+        if c_in != self.ch_in:
+            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
+        if n < self.ksize:
+            raise ValueError(f"Input must have at least {self.ksize} len!")
+        #
+        k = F.pad(self.kernel, (0, n - self.ksize))
+        #
+        k_f = torch.fft.fft(k, dim=-1)  # (out, in, n)
+        x_f = torch.fft.fft(x, dim=-1, norm="ortho")  # (b, in, n)
+        if k_f.numel() < (2 * x_f.numel()):
+            y = torch.einsum("oin,bin->bon", k_f.conj(), x_f)  # (b, out, n)
+        else:
+            y = torch.einsum("oin,bin->bon", k_f, x_f.conj()).conj()
+        #
+        y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, out, n)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1)  # (b, out, n)
+        #
+        return y
+
+
+class Circorr2d(torch.nn.Module):
+    """ """
+
+    def __init__(self, ch_in, ch_out, ksize, bias=True):
+        """ """
+        super().__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.ksize = ksize
+        self.kernel = torch.nn.Parameter(torch.randn(ch_out, ch_in, *ksize))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(ch_out))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        """ """
+        b, c_in, h, w = x.shape
+        if c_in != self.ch_in:
+            raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
+        if h < self.ksize[0]:
+            raise ValueError(f"Input must be larger than {self.ksize}!")
+        if w < self.ksize[1]:
+            raise ValueError(f"Input must be larger than {self.ksize}!")
+        #
+        k = F.pad(self.kernel, (0, w - self.ksize[1], 0, h - self.ksize[0]))
+        #
+        k_f = torch.fft.fft2(k, dim=(-2, -1))  # (out, in, H, W)
+        x_f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # (b, in, H, W)
+        if k_f.numel() < (2 * x_f.numel()):
+            y = torch.einsum("oihw,bihw->bohw", k_f.conj(), x_f)  # (b,o,H,W)
+        else:
+            y = torch.einsum("oihw,bihw->bohw", k_f, x_f.conj()).conj()
+        y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho").real  # (b, o, H, W)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1, 1)  # (b, out, H, W)
+        #
+        return y
 
 
 # ##############################################################################
