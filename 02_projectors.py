@@ -114,13 +114,13 @@ class IdempotentCircorr1d(torch.nn.Module):
         )[0].permute(1, 2, 0)
         #
         if k_f.numel() < (2 * x_f.numel()):
-            y = torch.einsum("oin,bin->bon", k_f.conj(), x_f)  # (b, out, n)
+            y = torch.einsum("oin,bin->bon", k_f_proj.conj(), x_f)  # (b,c,n)
         else:
-            y = torch.einsum("oin,bin->bon", k_f, x_f.conj()).conj()
+            y = torch.einsum("oin,bin->bon", k_f_proj, x_f.conj()).conj()
         #
-        y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, out, n)
+        y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, c, n)
         if self.bias is not None:
-            y = y + self.bias.view(1, -1, 1)  # (b, out, n)
+            y = y + self.bias.view(1, -1, 1)  # (b, c, n)
         #
         return y
 
