@@ -3,6 +3,13 @@
 
 
 """
+* we got trainable idempotent convs
+  - add trainable idempotent biases
+  - add error between FFT kernel and projected, optionally
+
+* What about nonlinearities? Maybe the projectization is enough?
+
+
 * Tenemos una conv layer que entrena
 * Pero habia la duda del kernel size, que se resuelve con el straight-through
 
@@ -55,28 +62,28 @@ class ProjStraightThrough(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, rank, saturation=1.0):
         """
-        :param x: batch of arbitrary square matrices
+        :param x: batch of arbitrary square matrices of shape ``(..., n, n)``.
         :param saturation: During backward step, eigenvalues are pushed to
           boolean via softmax. This parameter is the pre-softmax scaling. A
           larger saturation means closer to boolean: more similarity to a
           projector (gradients are les biased), but less quality of gradients.
 
         """
-        b, h, w = x.shape
+        h, w = x.shape[-2:]
         if h != w:
             raise ValueError(f"Only square matrices supported! {x.shape}")
         U, S, Vh = torch.linalg.svd(x)
         S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
         ctx.save_for_backward(U, S_soft, Vh)
         # batch-wise outer product for projectors
-        P = torch.matmul(U[..., :rank], U[..., :rank].permute(0, 2, 1).conj())
+        P = torch.matmul(U[..., :rank], U[..., :rank].transpose(-2, -1).conj())
         return P, S, S_soft
 
     @staticmethod
     def backward(ctx, grad_out):
         """ """
         U, S_soft, Vh = ctx.saved_tensors
-        P_soft = (U * S_soft.unsqueeze(1)) @ U.permute(0, 2, 1).conj()
+        P_soft = (U * S_soft.unsqueeze(-2)) @ U.transpose(-2, -1).conj()
         grad_in = grad_out @ P_soft + P_soft @ grad_out
         return grad_in, None, None
 
@@ -84,7 +91,7 @@ class ProjStraightThrough(torch.autograd.Function):
 class IdempotentCircorr1d(torch.nn.Module):
     """ """
 
-    def __init__(self, chans, ksize, rank, bias=True):
+    def __init__(self, chans, ksize, rank, bias=True, with_proj_dist=True):
         """ """
         super().__init__()
         self.chans = chans
@@ -95,6 +102,7 @@ class IdempotentCircorr1d(torch.nn.Module):
             self.bias = torch.nn.Parameter(torch.zeros(chans))
         else:
             self.register_parameter("bias", None)
+        self.with_proj_dist = with_proj_dist
 
     def forward(self, x):
         """ """
@@ -122,7 +130,55 @@ class IdempotentCircorr1d(torch.nn.Module):
         if self.bias is not None:
             y = y + self.bias.view(1, -1, 1)  # (b, c, n)
         #
-        return y
+        dist = torch.dist(k_f, k_f_proj) if self.with_proj_dist else None
+        return y, dist
+
+
+class IdempotentCircorr2d(torch.nn.Module):
+    """ """
+
+    def __init__(self, chans, ksize, rank, bias=True, with_proj_dist=True):
+        """ """
+        super().__init__()
+        self.chans = chans
+        self.ksize = ksize
+        self.rank = rank
+        self.kernel = torch.nn.Parameter(torch.randn(chans, chans, *ksize))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(chans))
+        else:
+            self.register_parameter("bias", None)
+        self.with_proj_dist = with_proj_dist
+
+    def forward(self, x):
+        """ """
+        b, c, h, w = x.shape
+        if c != self.chans:
+            raise ValueError(f"Expected {self.chans} channels, got {c}")
+        if h < self.ksize[0]:
+            raise ValueError(f"Input height must be >= {self.ksize}!")
+        if w < self.ksize[1]:
+            raise ValueError(f"Input width must be >= {self.ksize}!")
+        #
+        k = F.pad(self.kernel, (0, w - self.ksize[1], 0, h - self.ksize[0]))
+        #
+        x_f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # (b, in, H, W)
+        k_f = torch.fft.fft2(k, dim=(-2, -1))  # (out, in, H, W)
+
+        k_f_proj = ProjStraightThrough.apply(
+            k_f.permute(2, 3, 0, 1), self.rank, 1.0
+        )[0].permute(2, 3, 0, 1)
+        #
+        if k_f.numel() < (2 * x_f.numel()):
+            y = torch.einsum("oihw,bihw->bohw", k_f_proj.conj(), x_f)  # boHW
+        else:
+            y = torch.einsum("oihw,bihw->bohw", k_f_proj, x_f.conj()).conj()
+        y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho").real  # (b, o, H, W)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1, 1)  # (b, out, H, W)
+        #
+        dist = torch.dist(k_f, k_f_proj) if self.with_proj_dist else None
+        return y, dist
 
 
 # ##############################################################################
@@ -170,15 +226,12 @@ if __name__ == "__main__":
     y1 = CircularCorrelation.circorr1d(x, kernel)
     y2 = CircularCorrelation.circorr1d_fft(x, kernel).real
 
-    cc1d = Circorr1d(11, 5, 3, bias=False)
-    cc1d.kernel.data[:] = kernel
-    cc1d(x.unsqueeze(0))
-
-    quack = IdempotentCircorr1d(11, 3, 5, bias=False)
-    yy1 = quack(x.unsqueeze(0))
-    yy2 = quack(yy1)
-    yy3 = quack(yy2)
-    breakpoint()
+    # cc1d = Circorr1d(11, 5, 3, bias=False)
+    # cc1d.kernel.data[:] = kernel
+    # cc1d(x.unsqueeze(0))
+    # quack = IdempotentCircorr1d(11, 3, 5, bias=False)
+    # yy1, _ = quack(x.unsqueeze(0))
+    # yy2, _ = quack(yy1)
 
     #
     #
@@ -195,29 +248,14 @@ if __name__ == "__main__":
     yy1 = CircularCorrelation.circorr2d(xx, kernel2d)
     yy2 = CircularCorrelation.circorr2d_fft(xx, kernel2d)
 
-    """
-    PLAN:
+    #
+    #
+    #
+    quack = IdempotentCircorr2d(11, (3, 3), 5, bias=False)
+    yyy1, dst1 = quack(xx.unsqueeze(0))
+    yyy2, dst2 = quack(yyy1)
 
-    At this point, we should be able to train e.g. a small logistic conv
-    classifier on MNIST. This should be our 02 script
-
-    At this point, is time to investigate projectors:
-      - how is the equiv between proj-spectrum and circulant? can we convert?
-      - is idempotence respected for arbitrary projs and kernel biases?
-
-    As well as their gradients:
-      - Does the projected grad respect the constraints?
-      - Does it decrease the loss when trained?
-      - Our 03 script should be a projector version of the 02 script, where each
-        step tests an idempotence loss
-      - We should also test a linear layer and conv1d.
-
-
-    At this point, we have a repertoire of affine transforms that are idempotent
-    and trainable via gradients. make a larger net and solve some task. Think
-    about nonlinearities
-
-    """
+    breakpoint()
 
     # in this case we observe that our conv1d indeed performs dotprods as-is,
     # and shifts the kernel across the signal. x=(b, in, n), k=(out,in,n)

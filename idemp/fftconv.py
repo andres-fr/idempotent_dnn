@@ -113,9 +113,9 @@ class Circorr2d(torch.nn.Module):
         if c_in != self.ch_in:
             raise ValueError(f"Expected {self.ch_in} channels, got {c_in}")
         if h < self.ksize[0]:
-            raise ValueError(f"Input must be larger than {self.ksize}!")
+            raise ValueError(f"Input height must be >= {self.ksize}!")
         if w < self.ksize[1]:
-            raise ValueError(f"Input must be larger than {self.ksize}!")
+            raise ValueError(f"Input width must be >= {self.ksize}!")
         #
         k = F.pad(self.kernel, (0, w - self.ksize[1], 0, h - self.ksize[0]))
         #
