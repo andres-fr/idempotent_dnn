@@ -78,14 +78,15 @@ class ProjStraightThrough(torch.autograd.Function):
         # batch-wise outer product for projectors
         U_k = U[..., :rank]
         P = torch.matmul(U_k, U_k.transpose(-2, -1).conj())
-        return P, U_k, S, S_soft
+        return P  # , U_k, S, S_soft
 
     @staticmethod
     def backward(ctx, grad_out):
         """ """
+        # grad_out seems to be of same shape as P (..., n, n)
         U, S_soft, Vh = ctx.saved_tensors
         P_soft = (U * S_soft.unsqueeze(-2)) @ U.transpose(-2, -1).conj()
-        grad_in = grad_out @ P_soft + P_soft @ grad_out
+        grad_in = grad_out @ P_soft + P_soft @ grad_out  # (n,n)@(n,n) matmul
         return grad_in, None, None
 
 
@@ -121,7 +122,7 @@ class IdempotentCircorr1d(torch.nn.Module):
         #
         k_f_proj = ProjStraightThrough.apply(  # (c, c, n)
             k_f.permute(2, 0, 1), self.rank, 1.0
-        )[0].permute(1, 2, 0)
+        ).permute(1, 2, 0)
         #
         if k_f.numel() < (2 * x_f.numel()):
             y = torch.einsum("oin,bin->bon", k_f_proj.conj(), x_f)  # (b,c,n)
@@ -155,7 +156,7 @@ class IdempotentCircorr2d(torch.nn.Module):
         self.kernel = torch.nn.Parameter(torch.randn(chans, chans, *ksize))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(chans))
-            self.bias.data.normal_(0.1)
+            # self.bias.data.normal_(0.1)
         else:
             self.register_parameter("bias", None)
         self.with_proj_dist = with_proj_dist
@@ -177,7 +178,7 @@ class IdempotentCircorr2d(torch.nn.Module):
 
         k_f_proj = ProjStraightThrough.apply(
             k_f.permute(2, 3, 0, 1), self.rank, 1.0
-        )[0].permute(2, 3, 0, 1)
+        ).permute(2, 3, 0, 1)
         #
         if k_f.numel() < (2 * x_f.numel()):
             y = torch.einsum("oihw,bihw->bohw", k_f_proj.conj(), x_f)  # boHW
@@ -273,8 +274,6 @@ if __name__ == "__main__":
     yyy1, dst1 = quack(xx.unsqueeze(0))
     yyy2, dst2 = quack(yyy1)
 
-    breakpoint()
-
     # in this case we observe that our conv1d indeed performs dotprods as-is,
     # and shifts the kernel across the signal. x=(b, in, n), k=(out,in,n)
     x = torch.arange(10, dtype=DTYPE, device=DEVICE).reshape(2, 1, 5)
@@ -293,10 +292,38 @@ if __name__ == "__main__":
     yy = circorr2d_fft(xx, kk).real
 
     CC1 = Circorr1d(1, 1, 3, bias=True)
-    CC1(x)
 
-    CC2 = Circorr2d(1, 1, (3, 4), bias=True)
     loss_fn = torch.nn.MSELoss()
+
+    #
+    #
+    xx = (  # (1, 11, 5, 5)  bchw
+        torch.arange(25, dtype=DTYPE, device=DEVICE)
+        .view(1, 1, -1)
+        .reshape(1, 1, 5, 5)
+        .repeat(1, 11, 1, 1)
+    )
+    CC2 = IdempotentCircorr2d(11, (3, 3), 5, bias=True)
+    opt = torch.optim.SGD(
+        CC2.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-2
+    )
+    for i in range(20000):
+        opt.zero_grad()
+        z, dst = CC2(xx)
+        loss = loss_fn(z, xx)
+        loss.backward()
+        opt.step()
+        if i % 500 == 0:
+            print(i, "loss:", loss)
+
+    breakpoint()
+
+    # plt.clf(); plt.plot(CC2.bias.detach().numpy()); plt.show()
+    # plt.clf(); plt.plot(CC2.bias.detach().numpy()); plt.show()
+    #
+    #
+    #
+    CC2 = Circorr2d(1, 1, (3, 4), bias=True)
     opt = torch.optim.SGD(
         CC2.parameters(), lr=1e-5, momentum=0.9, weight_decay=1e-2
     )
