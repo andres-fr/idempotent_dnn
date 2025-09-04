@@ -46,6 +46,7 @@ If we reach this point, we will have trainable idempotent layers! what now?
 import os
 import torch
 import torch.nn.functional as F
+import torchvision
 import matplotlib.pyplot as plt
 
 from idemp.utils import gaussian_noise
@@ -63,18 +64,101 @@ from idemp.projectors import (
 # ##############################################################################
 # # HELPERS
 # ##############################################################################
+class IdempotentMLP(torch.nn.Module):
+    """ """
+
+    def __init__(
+        self,
+        in_dims=784,
+        hidden_dims=100,
+        hidden_rank=20,
+        num_hidden=3,
+        saturation=2.0,
+    ):
+        """ """
+        super().__init__()
+        self.head = torch.nn.Linear(in_dims, hidden_dims, bias=True)
+        # self.body = [
+        #     IdempotentLinear(hidden_dims, hidden_rank, bias=True, saturation=saturation)
+        #     for _ in range(num_hidden)
+        # ]
+        self.test1 = IdempotentLinear(
+            hidden_dims, hidden_rank, bias=True, saturation=saturation
+        )
+        self.test2 = IdempotentLinear(
+            hidden_dims, hidden_rank, bias=True, saturation=saturation
+        )
+        self.tail = torch.nn.Linear(hidden_dims, in_dims, bias=True)
+
+    def forward(self, x):
+        """ """
+        x = self.head(x)
+        dists = []
+        # for lyr in self.body:
+        #     x, dist = lyr(x)
+        #     dists.append(dist)
+        # x, dist1 = self.test1(x)
+        # dists.append(dist1)
+        # x, dist2 = self.test2(x)
+        # dists.append(dist2)
+        x = torch.tanh(x)
+        x = self.tail(x)
+        return x, dists
 
 
 # ##############################################################################
 # # MAIN ROUTINE
 # ##############################################################################
 if __name__ == "__main__":
-    DTYPE, DEVICE = torch.float32, "cpu"
+    # DTYPE, DEVICE = torch.float32, "cpu"
+    DEVICE = "cpu"  #  "cuda" if torch.cuda.is_available() else "cpu"
+    FMNIST_PATH = os.path.join("datasets", "FashionMNIST")
+    BATCH_SIZE = 40
+    LR, MOMENTUM, WEIGHT_DECAY = 1e-2, 0.9, 1e-3  #  1e-5, 0.9, 1e-4
 
-    kk = IdempotentLinear(50, 5, bias=True)
-    xx = gaussian_noise((7, 50), seed=1205, dtype=DTYPE, device=DEVICE)
+    train_ds = torchvision.datasets.FashionMNIST(
+        FMNIST_PATH,
+        train=True,
+        transform=torchvision.transforms.ToTensor(),
+        target_transform=None,
+        download=True,
+    )
+    train_dl = torch.utils.data.DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True
+    )
 
-    yy, dst = kk(xx)
+    model = IdempotentMLP(
+        in_dims=784, hidden_dims=700, hidden_rank=650, num_hidden=1
+    ).to(DEVICE)
+    opt = torch.optim.SGD(
+        model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
+    )
+    # loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    #
+    global_step = 0
+    for epoch in range(4):
+        for i, (imgs, targets) in enumerate(train_dl):
+            imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
+            opt.zero_grad()
+            logits, dists = model(imgs.reshape(BATCH_SIZE, -1))
+            logits = logits.reshape(imgs.shape)
+            loss = loss_fn(logits, imgs)
+            loss.backward()
+            opt.step()
+            if global_step % 200 == 0:
+                print(
+                    f"{epoch}/{i}",
+                    "loss:",
+                    loss.item(),
+                    "dst:",
+                    [d.item() for d in dists],
+                )
+            global_step += 1
+
+    #
+    # idx=0; fig, (ax1, ax2) = plt.subplots(ncols=2); ax1.imshow(imgs[idx, 0].detach()), ax2.imshow(logits[idx, 0].sigmoid().detach()); fig.show()
+    # fig.show()
     breakpoint()
     # p1, _ = gaussian_projector(20, 5, orth=True, seed=12345)
 

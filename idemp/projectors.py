@@ -90,7 +90,12 @@ class ProjStraightThrough(torch.autograd.Function):
         if h != w:
             raise ValueError(f"Only square matrices supported! {x.shape}")
         U, S, Vh = torch.linalg.svd(x)
-        S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
+        if len(S.shape) == 1:
+            S_soft = torch.sigmoid(saturation * (S - S[rank]))
+        elif len(S.shape) == 2:
+            S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
+        else:
+            raise NotImplementedError("Get rid of transpose!")
         ctx.save_for_backward(U, S_soft, Vh)
         # batch-wise outer product for projectors
         U_k = U[..., :rank]
@@ -113,11 +118,14 @@ class ProjStraightThrough(torch.autograd.Function):
 class IdempotentLinear(torch.nn.Module):
     """ """
 
-    def __init__(self, dims, rank, bias=True, with_proj_dist=True):
+    def __init__(
+        self, dims, rank, bias=True, with_proj_dist=True, saturation=1.0
+    ):
         """ """
         super().__init__()
         self.dims = dims
         self.rank = rank
+        self.saturation = saturation
         self.weight = torch.nn.Parameter(torch.randn(dims, dims))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(dims))
@@ -131,7 +139,9 @@ class IdempotentLinear(torch.nn.Module):
         b, n = x.shape
         if n != self.dims:
             raise ValueError(f"Expected {self.dims} dims, got {n}")
-        w_proj = ProjStraightThrough.apply(self.weight, self.rank)
+        w_proj = ProjStraightThrough.apply(
+            self.weight, self.rank, self.saturation
+        )
         x = torch.einsum("oi,bi->bo", w_proj, x)
         if self.bias is not None:
             bias_negproj = self.bias - w_proj @ self.bias
@@ -147,12 +157,21 @@ class IdempotentLinear(torch.nn.Module):
 class IdempotentCircorr1d(torch.nn.Module):
     """ """
 
-    def __init__(self, chans, ksize, rank, bias=True, with_proj_dist=True):
+    def __init__(
+        self,
+        chans,
+        ksize,
+        rank,
+        bias=True,
+        with_proj_dist=True,
+        saturation=1.0,
+    ):
         """ """
         super().__init__()
         self.chans = chans
         self.ksize = ksize
         self.rank = rank
+        self.saturation = saturation
         self.kernel = torch.nn.Parameter(torch.randn(chans, chans, ksize))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(chans))
@@ -175,7 +194,7 @@ class IdempotentCircorr1d(torch.nn.Module):
         k_f = torch.fft.fft(k, dim=-1)  # (c, c, n)
         #
         k_f_proj = ProjStraightThrough.apply(  # (c, c, n)
-            k_f.permute(2, 0, 1), self.rank, 1.0
+            k_f.permute(2, 0, 1), self.rank, self.saturation
         ).permute(1, 2, 0)
         #
         if k_f.numel() < (2 * x_f.numel()):
@@ -201,12 +220,21 @@ class IdempotentCircorr1d(torch.nn.Module):
 class IdempotentCircorr2d(torch.nn.Module):
     """ """
 
-    def __init__(self, chans, ksize, rank, bias=True, with_proj_dist=True):
+    def __init__(
+        self,
+        chans,
+        ksize,
+        rank,
+        bias=True,
+        with_proj_dist=True,
+        saturation=1.0,
+    ):
         """ """
         super().__init__()
         self.chans = chans
         self.ksize = ksize
         self.rank = rank
+        self.saturation = saturation
         self.kernel = torch.nn.Parameter(torch.randn(chans, chans, *ksize))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(chans))
@@ -231,7 +259,7 @@ class IdempotentCircorr2d(torch.nn.Module):
         k_f = torch.fft.fft2(k, dim=(-2, -1))  # (out, in, H, W)
 
         k_f_proj = ProjStraightThrough.apply(
-            k_f.permute(2, 3, 0, 1), self.rank, 1.0
+            k_f.permute(2, 3, 0, 1), self.rank, self.saturation
         ).permute(2, 3, 0, 1)
         #
         if k_f.numel() < (2 * x_f.numel()):
