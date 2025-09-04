@@ -76,8 +76,9 @@ class ProjStraightThrough(torch.autograd.Function):
         S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
         ctx.save_for_backward(U, S_soft, Vh)
         # batch-wise outer product for projectors
-        P = torch.matmul(U[..., :rank], U[..., :rank].transpose(-2, -1).conj())
-        return P, S, S_soft
+        U_k = U[..., :rank]
+        P = torch.matmul(U_k, U_k.transpose(-2, -1).conj())
+        return P, U_k, S, S_soft
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -100,6 +101,7 @@ class IdempotentCircorr1d(torch.nn.Module):
         self.kernel = torch.nn.Parameter(torch.randn(chans, chans, ksize))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(chans))
+            # self.bias.data.normal_(0.1)
         else:
             self.register_parameter("bias", None)
         self.with_proj_dist = with_proj_dist
@@ -128,7 +130,14 @@ class IdempotentCircorr1d(torch.nn.Module):
         #
         y = torch.fft.ifft(y, dim=-1, norm="ortho").real  # (b, c, n)
         if self.bias is not None:
-            y = y + self.bias.view(1, -1, 1)  # (b, c, n)
+            # this works because the FFT of the bias would be computed by
+            # taking n copies and getting the FFT across the n axis. This
+            # results in a real-valued DC component (scaled by n**0.5), and
+            # the rest is zeros. Due to this identity up to scale, the desired
+            # negproj across channels in the freq domain can be achieved in
+            # the "plain" n domain
+            bias_negproj = self.bias - k_f_proj[..., 0].real @ self.bias
+            y = y + bias_negproj.view(-1, 1)  # (b, c, n)
         #
         dist = torch.dist(k_f, k_f_proj) if self.with_proj_dist else None
         return y, dist
@@ -146,6 +155,7 @@ class IdempotentCircorr2d(torch.nn.Module):
         self.kernel = torch.nn.Parameter(torch.randn(chans, chans, *ksize))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(chans))
+            self.bias.data.normal_(0.1)
         else:
             self.register_parameter("bias", None)
         self.with_proj_dist = with_proj_dist
@@ -175,7 +185,14 @@ class IdempotentCircorr2d(torch.nn.Module):
             y = torch.einsum("oihw,bihw->bohw", k_f_proj, x_f.conj()).conj()
         y = torch.fft.ifft2(y, dim=(-2, -1), norm="ortho").real  # (b, o, H, W)
         if self.bias is not None:
-            y = y + self.bias.view(1, -1, 1, 1)  # (b, out, H, W)
+            # this works because the FFT of the bias would be computed by
+            # taking n copies and getting the FFT across the n axis. This
+            # results in a real-valued DC component (scaled by n**0.5), and
+            # the rest is zeros. Due to this identity up to scale, the desired
+            # negproj across channels in the freq domain can be achieved in
+            # the "plain" n domain
+            bias_negproj = self.bias - k_f_proj[..., 0, 0].real @ self.bias
+            y = y + bias_negproj.view(-1, 1, 1)  # (b, c, H, W)
         #
         dist = torch.dist(k_f, k_f_proj) if self.with_proj_dist else None
         return y, dist
@@ -229,9 +246,10 @@ if __name__ == "__main__":
     # cc1d = Circorr1d(11, 5, 3, bias=False)
     # cc1d.kernel.data[:] = kernel
     # cc1d(x.unsqueeze(0))
-    # quack = IdempotentCircorr1d(11, 3, 5, bias=False)
-    # yy1, _ = quack(x.unsqueeze(0))
-    # yy2, _ = quack(yy1)
+    quack = IdempotentCircorr1d(11, 3, 5, bias=True)
+    yy1, _ = quack(x.unsqueeze(0))
+    yy2, _ = quack(yy1)
+    # breakpoint()
 
     #
     #
@@ -251,7 +269,7 @@ if __name__ == "__main__":
     #
     #
     #
-    quack = IdempotentCircorr2d(11, (3, 3), 5, bias=False)
+    quack = IdempotentCircorr2d(11, (3, 3), 5, bias=True)
     yyy1, dst1 = quack(xx.unsqueeze(0))
     yyy2, dst2 = quack(yyy1)
 
