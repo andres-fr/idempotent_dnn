@@ -106,15 +106,76 @@ class IdempotentMLP(torch.nn.Module):
         return x, dists
 
 
+class MNIST_Net_Baseline(torch.nn.Module):
+    """
+    This one works well on FMNIST trained for 10 epochs with BCELoss and
+    Adam(lr=1e-4).
+    """
+
+    def __init__(self, activation=torch.nn.Tanh):
+        super().__init__()
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(784, 784),
+            activation(),
+            torch.nn.Linear(784, 512),
+            activation(),
+        )
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(512, 784),
+            activation(),
+            torch.nn.Linear(784, 784),
+            torch.nn.Sigmoid(),  # Sigmoid to get output values between 0 and 1
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x, []
+
+
+class MNIST_Net(torch.nn.Module):
+    """
+    This one works well on FMNIST trained for 10 epochs with BCELoss and
+    Adam(lr=1e-4). 0.24 loss is already decent
+    """
+
+    def __init__(self, activation=torch.nn.Tanh):
+        super().__init__()
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(784, 512),
+            activation(),
+            # torch.nn.Linear(512, 512),
+            # activation(),
+            # torch.nn.Linear(512, 512),
+        )
+        self.ip1 = IdempotentLinear(512, 500, bias=True, saturation=2.0)
+        self.ip2 = IdempotentLinear(512, 500, bias=True, saturation=2.0)
+        self.decoder = torch.nn.Sequential(
+            # torch.nn.Linear(512, 512),
+            # activation(),
+            # torch.nn.Linear(512, 512),
+            # activation(),
+            torch.nn.Linear(512, 784),
+            torch.nn.Sigmoid(),  # Sigmoid to get output values between 0 and 1
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x, dst1 = self.ip1(x)
+        x, dst2 = self.ip2(x)
+        x = self.decoder(x)
+        return x, [dst1, dst2]
+
+
 # ##############################################################################
 # # MAIN ROUTINE
 # ##############################################################################
 if __name__ == "__main__":
-    # DTYPE, DEVICE = torch.float32, "cpu"
+    DTYPE = torch.float32
     DEVICE = "cpu"  #  "cuda" if torch.cuda.is_available() else "cpu"
     FMNIST_PATH = os.path.join("datasets", "FashionMNIST")
     BATCH_SIZE = 40
-    LR, MOMENTUM, WEIGHT_DECAY = 1e-2, 0.9, 1e-3  #  1e-5, 0.9, 1e-4
+    LR, MOMENTUM, WEIGHT_DECAY = 1e-4, 0, 1e-6  #  1e-5, 0.9, 1e-4
 
     train_ds = torchvision.datasets.FashionMNIST(
         FMNIST_PATH,
@@ -127,23 +188,28 @@ if __name__ == "__main__":
         train_ds, batch_size=BATCH_SIZE, shuffle=True
     )
 
-    model = IdempotentMLP(
-        in_dims=784, hidden_dims=700, hidden_rank=650, num_hidden=1
-    ).to(DEVICE)
-    opt = torch.optim.SGD(
-        model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
+    # model = IdempotentMLP(
+    #     in_dims=784, hidden_dims=700, hidden_rank=650, num_hidden=1
+    # ).to(DEVICE)
+    model = MNIST_Net().to(DEVICE)
+    # opt = torch.optim.SGD(
+    #     model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
+    # )
+    opt = torch.optim.Adam(
+        model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
     # loss_fn = torch.nn.MSELoss()
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    # loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.BCELoss()
     #
     global_step = 0
-    for epoch in range(4):
+    for epoch in range(15):
         for i, (imgs, targets) in enumerate(train_dl):
             imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
             opt.zero_grad()
-            logits, dists = model(imgs.reshape(BATCH_SIZE, -1))
-            logits = logits.reshape(imgs.shape)
-            loss = loss_fn(logits, imgs)
+            preds, dists = model(imgs.reshape(BATCH_SIZE, -1))
+            preds = preds.reshape(imgs.shape)
+            loss = loss_fn(preds, imgs)
             loss.backward()
             opt.step()
             if global_step % 200 == 0:
@@ -156,9 +222,8 @@ if __name__ == "__main__":
                 )
             global_step += 1
 
-    #
-    # idx=0; fig, (ax1, ax2) = plt.subplots(ncols=2); ax1.imshow(imgs[idx, 0].detach()), ax2.imshow(logits[idx, 0].sigmoid().detach()); fig.show()
-    # fig.show()
+    # 0.24 BCELoss is good
+    # idx = 0; fig, (ax1, ax2) = plt.subplots(ncols=2); ax1.imshow(imgs[idx, 0].detach()), ax2.imshow(preds[idx, 0].detach()); fig.show()
     breakpoint()
     # p1, _ = gaussian_projector(20, 5, orth=True, seed=12345)
 
@@ -206,7 +271,6 @@ if __name__ == "__main__":
     quack = IdempotentCircorr1d(11, 3, 5, bias=True)
     yy1, _ = quack(x.unsqueeze(0))
     yy2, _ = quack(yy1)
-    # breakpoint()
 
     #
     #

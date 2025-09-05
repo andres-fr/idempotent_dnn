@@ -95,7 +95,8 @@ class ProjStraightThrough(torch.autograd.Function):
         elif len(S.shape) == 2:
             S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
         else:
-            raise NotImplementedError("Get rid of transpose!")
+            S_soft = torch.sigmoid(saturation * (S.T - S.T[rank]).T)
+            # raise NotImplementedError("Get rid of transpose!")
         ctx.save_for_backward(U, S_soft, Vh)
         # batch-wise outer product for projectors
         U_k = U[..., :rank]
