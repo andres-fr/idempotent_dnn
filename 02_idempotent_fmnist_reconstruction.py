@@ -5,6 +5,13 @@
 """
 TODO:
 
+* we got an MLP that beats linear and almost overfits FMNIST with linear enc.
+* Now, replace layers with idemp and obtain similar scenario
+  - idemp encoder represents a subspace
+  - ???
+* Idempotence works, now leverage it for OOD. How??
+* Move onto conv and segmentation
+
 * first and foremost, get a freaking MLP that beats PCA
 * then, run the analogous idempotent as up @ [idemp/activ]  @ down
   - should also beat PCA and also be good
@@ -116,9 +123,10 @@ def initialize_module(model, distr=torch.nn.init.xavier_uniform_, bias_val=0):
 class PCA_MLP(torch.nn.Module):
     """ """
 
-    def __init__(self, hidden_dims=350):
+    def __init__(self, hidden_dims=350, sigmoid_out=False):
         """ """
         super().__init__()
+        self.sigmoid_out = sigmoid_out
         self.down = torch.nn.Linear(784, hidden_dims)
         self.up = torch.nn.Linear(hidden_dims, 784)
         initialize_module(self, torch.nn.init.xavier_uniform_, 0)
@@ -128,6 +136,8 @@ class PCA_MLP(torch.nn.Module):
         dsts = []
         x = self.down(x)
         x = self.up(x)
+        if self.sigmoid_out:
+            x = F.sigmoid(x)
         return x, dsts
 
 
@@ -152,10 +162,10 @@ class MultichanMLP(torch.nn.Module):
 
     def __init__(
         self,
-        zdim=350,
+        zdim=150,
         chans=30,
         xdim=784,
-        hdim=500,
+        hdim=350,
         with_1b=True,
         with_2b=True,
     ):
@@ -163,29 +173,29 @@ class MultichanMLP(torch.nn.Module):
         self.with_1b, self.with_2b = with_1b, with_2b
         super().__init__()
         self.enc = torch.nn.Sequential(
-            torch.nn.Linear(784, zdim),
+            torch.nn.Linear(xdim, zdim),
         )
         #
-        self.dec_weight1 = torch.nn.Parameter(torch.randn(500, zdim, chans))
-        self.dec_bias1 = torch.nn.Parameter(torch.randn(500, chans))
+        self.dec_weight1 = torch.nn.Parameter(torch.randn(hdim, zdim, chans))
+        self.dec_bias1 = torch.nn.Parameter(torch.randn(hdim, chans))
         #
         if with_1b:
             self.dec_weight1b = torch.nn.Parameter(
-                torch.randn(500, chans, chans)
+                torch.randn(hdim, chans, chans)
             )
-            self.dec_bias1b = torch.nn.Parameter(torch.randn(500, chans))
+            self.dec_bias1b = torch.nn.Parameter(torch.randn(hdim, chans))
         #
-        self.dec_weight2 = torch.nn.Parameter(torch.randn(784, 500, chans))
-        self.dec_bias2 = torch.nn.Parameter(torch.randn(784, chans))
+        self.dec_weight2 = torch.nn.Parameter(torch.randn(xdim, hdim, chans))
+        self.dec_bias2 = torch.nn.Parameter(torch.randn(xdim, chans))
         #
         if with_2b:
             self.dec_weight2b = torch.nn.Parameter(
-                torch.randn(784, chans, chans)
+                torch.randn(xdim, chans, chans)
             )
-            self.dec_bias2b = torch.nn.Parameter(torch.randn(784, chans))
+            self.dec_bias2b = torch.nn.Parameter(torch.randn(xdim, chans))
         #
-        self.dec_weight3 = torch.nn.Parameter(torch.randn(784, chans))
-        self.dec_bias3 = torch.nn.Parameter(torch.randn(784))
+        self.dec_weight3 = torch.nn.Parameter(torch.randn(xdim, chans))
+        self.dec_bias3 = torch.nn.Parameter(torch.randn(xdim))
         #
         initialize_module(self, torch.nn.init.xavier_uniform_, 0)
 
@@ -194,21 +204,21 @@ class MultichanMLP(torch.nn.Module):
         x = self.enc(x)  # b, zdim
         #
         x = torch.einsum("oic,bi->boc", self.dec_weight1, x) + self.dec_bias1
-        x = F.gelu(x)  # b, 500, c
+        x = F.gelu(x)  # b, hdim, c
         #
         if self.with_1b:
             x = torch.einsum("nck,bnc->bnk", self.dec_weight1b, x)
-            x = F.gelu(x + self.dec_bias1b)
+            x = F.gelu(x + self.dec_bias1b)  # b, hdim, c
         #
         x = torch.einsum("oic,bic->boc", self.dec_weight2, x) + self.dec_bias2
-        x = F.gelu(x)  # b, 784, c
+        x = F.gelu(x)  # b, xdim, c
         #
         if self.with_2b:
             x = torch.einsum("nck,bnc->bnk", self.dec_weight2b, x)
-            x = F.gelu(x + self.dec_bias2b)
+            x = F.gelu(x + self.dec_bias2b)  # b, xdim, c
         #
         x = torch.einsum("nc,bnc->bn", self.dec_weight3, x) + self.dec_bias3
-        x = F.sigmoid(x)
+        x = F.sigmoid(x)  # b, xdim
         return x, []
 
 
@@ -219,7 +229,7 @@ if __name__ == "__main__":
     DTYPE = torch.float32
     DEVICE = "cuda"  #  "cuda" if torch.cuda.is_available() else "cpu"
     FMNIST_PATH = os.path.join("datasets", "FashionMNIST")
-    BATCH_SIZE = 60  # 30
+    BATCH_SIZE = 80  # 30
     LR, MOMENTUM, WEIGHT_DECAY = 5e-4, 0, 0  #  1e-5, 0.9, 1e-4
     NUM_EPOCHS = 70
 
@@ -234,8 +244,8 @@ if __name__ == "__main__":
         train_ds, batch_size=BATCH_SIZE, shuffle=True
     )
 
-    model1 = MultichanMLP(350).to(DEVICE)  # RegularMLP(350).to(DEVICE)
-    model2 = PCA_MLP(350).to(DEVICE)  # IdempotentMLP(350, rank=150).to(DEVICE)
+    model1 = MultichanMLP(zdim=100, chans=40, hdim=300).to(DEVICE)
+    model2 = PCA_MLP(100, sigmoid_out=True).to(DEVICE)
     opt1 = torch.optim.Adam(
         model1.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
@@ -290,3 +300,5 @@ if __name__ == "__main__":
     # idx = 0; fig, (ax1, ax2, ax3) = plt.subplots(ncols=3); ax1.imshow(imgs[idx, 0].detach().cpu()), ax2.imshow(preds1[idx, 0].detach().cpu()); ax3.imshow(preds2[idx, 0].detach().cpu()); fig.show()
     # idx = 0; fig, (ax1, ax2) = plt.subplots(ncols=2); ax1.imshow(imgs[idx, 0].detach()), ax2.imshow(preds1[idx, 0].sigmoid().detach()); fig.show()
     breakpoint()
+
+    # mmm = model1; sum(p.numel() for p in mmm.parameters() if p.requires_grad)
