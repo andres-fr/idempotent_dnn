@@ -69,9 +69,16 @@ import torchvision
 import matplotlib.pyplot as plt
 
 from idemp.utils import gaussian_noise
+
+from idemp.models import LinearMLP, MultichannelMLP, initialize_module
+
 from idemp.fftconv import circorr1d_fft, circorr2d_fft, CircularCorrelation
 from idemp.fftconv import Circorr1d, Circorr2d
-from idemp.projectors import gaussian_projector, mutually_orthogonal_projectors
+from idemp.projectors import (
+    gaussian_projector,
+    mutually_orthogonal_projectors,
+    ProjStraightThrough,
+)
 
 from idemp.projectors import (
     IdempotentLinear,
@@ -83,98 +90,70 @@ from idemp.projectors import (
 # ##############################################################################
 # # HELPERS
 # ##############################################################################
-def initialize_module(model, distr=torch.nn.init.xavier_uniform_, bias_val=0):
+class IdempotentEinsum(torch.nn.Module):
     """ """
-    for pname, p in model.named_parameters():
-        if "weight" in pname:
-            distr(p)
-        elif "bias" in pname:
-            p.data[:] = bias_val
-        else:
-            # distr(p)
-            raise NotImplementedError(f"Unknown weight: {pname}")
-
-
-# class IdempotentMLP(torch.nn.Module):
-#     """
-#     This one works well on FMNIST trained for 15 epochs with BCELoss and
-#     Adam(lr=1e-3, wd=1e-5). 0.25 loss is already decent
-#     """
-
-#     def __init__(self, hidden_dims=350, rank=150, activation=torch.nn.Tanh):
-#         """ """
-#         super().__init__()
-#         self.down = torch.nn.Linear(784, hidden_dims)
-#         self.h1 = IdempotentLinear(hidden_dims, rank, bias=True, saturation=2)
-#         self.a1 = activation()
-#         self.up = torch.nn.Linear(hidden_dims, 784)
-
-#     def forward(self, x):
-#         """ """
-#         dsts = []
-#         x = self.down(x)
-#         x, dst1 = self.h1(x)
-#         dsts.append(dst1)
-#         x = self.a1(x)
-#         x = self.up(x)
-#         return x, dsts
-
-
-class PCA_MLP(torch.nn.Module):
-    """ """
-
-    def __init__(self, hidden_dims=350, sigmoid_out=False):
-        """ """
-        super().__init__()
-        self.sigmoid_out = sigmoid_out
-        self.down = torch.nn.Linear(784, hidden_dims)
-        self.up = torch.nn.Linear(hidden_dims, 784)
-        initialize_module(self, torch.nn.init.xavier_uniform_, 0)
-
-    def forward(self, x):
-        """ """
-        dsts = []
-        x = self.down(x)
-        x = self.up(x)
-        if self.sigmoid_out:
-            x = F.sigmoid(x)
-        return x, dsts
-
-
-class MultichanMLP(torch.nn.Module):
-    """
-
-    This MLP autoencoder has a simple, linear encoder and a more complex,
-    feedforward decoder that alternates pixel-layers with channel-layers:
-    * In the first decoder layer, ``hdim`` copies of the ``zdim``-dimensional
-      latent code are created, and for each copy, a linear layer is applied,
-      producing ``chans`` features.
-    * The following channel-layer contains, for each copy, a ``chan*chan``
-      linear layer that acts as channel mixer
-    * The following pixel-layer consists of a linear layer that is applied
-      to each channel idependently, mapping from any number of copies
-      (e.g. ``hdim``) to a different number of copies (e.g. 784).
-
-    Alternating channel mixers with pixel mixers allows to overfit the FMNIST
-    reconstruction task, while keeping a feedforward, linear MLP style and
-    a very simple encoder.
-    """
 
     def __init__(
         self,
-        zdim=150,
-        chans=30,
+        wshape,
+        wx_einstring,
+        wb_einstring,
+        rank,
+        bias_shape=None,
+        with_proj_dist=True,
+        saturation=1.0,
+    ):
+        """ """
+        super().__init__()
+        self.wx_einstring = wx_einstring
+        self.wb_einstring = wb_einstring
+        self.rank = rank
+        self.saturation = saturation
+        self.weight = torch.nn.Parameter(torch.randn(*wshape))
+        if bias_shape is not None:
+            self.bias = torch.nn.Parameter(torch.zeros(*bias_shape))
+            # self.bias.data.normal_(0.1)
+        else:
+            self.register_parameter("bias", None)
+        self.with_proj_dist = with_proj_dist
+
+    def forward(self, x):
+        """ """
+        w_proj = ProjStraightThrough.apply(
+            self.weight.permute(2, 0, 1), self.rank, self.saturation
+        ).permute(1, 2, 0)
+        x = torch.einsum(self.wx_einstring, w_proj, x)
+        if self.bias is not None:
+            bias_negproj = self.bias - torch.einsum(
+                self.wb_einstring, w_proj, self.bias
+            )
+            x = x + bias_negproj
+        dist = torch.dist(self.weight, w_proj) if self.with_proj_dist else None
+        return x, dist
+
+
+class IdempotentMultichannelMLP(torch.nn.Module):
+    """ """
+
+    def __init__(
+        self,
+        zdim=50,
+        chans=50,
         xdim=784,
         hdim=350,
         with_1b=True,
         with_2b=True,
+        activation=F.gelu,
+        logits=False,
+        saturation=2.0,
     ):
-        """ """
-        self.with_1b, self.with_2b = with_1b, with_2b
+        self.with_1b = with_1b
+        self.with_2b = with_2b
+        self.activation = activation
+        self.logits = logits
+        #
         super().__init__()
-        self.enc = torch.nn.Sequential(
-            torch.nn.Linear(xdim, zdim),
-        )
+        self.enc = torch.nn.Linear(xdim, zdim)
         #
         self.dec_weight1 = torch.nn.Parameter(torch.randn(hdim, zdim, chans))
         self.dec_bias1 = torch.nn.Parameter(torch.randn(hdim, chans))
@@ -185,17 +164,27 @@ class MultichanMLP(torch.nn.Module):
             )
             self.dec_bias1b = torch.nn.Parameter(torch.randn(hdim, chans))
         #
-        self.dec_weight2 = torch.nn.Parameter(torch.randn(xdim, hdim, chans))
-        self.dec_bias2 = torch.nn.Parameter(torch.randn(xdim, chans))
-        #
+        self.dec2 = IdempotentEinsum(
+            (hdim, hdim, chans),
+            "oic,bic->boc",
+            "oic,ic->oc",
+            rank=hdim // 2,
+            bias_shape=(hdim, chans),
+            with_proj_dist=True,
+            saturation=saturation,
+        )
+        # self.dec_weight2 = torch.nn.Parameter(torch.randn(xdim, hdim, chans))
+        # self.dec_bias2 = torch.nn.Parameter(torch.randn(xdim, chans))
+        # #
         if with_2b:
             self.dec_weight2b = torch.nn.Parameter(
-                torch.randn(xdim, chans, chans)
+                torch.randn(hdim, chans, chans)
             )
-            self.dec_bias2b = torch.nn.Parameter(torch.randn(xdim, chans))
+            self.dec_bias2b = torch.nn.Parameter(torch.randn(hdim, chans))
         #
-        self.dec_weight3 = torch.nn.Parameter(torch.randn(xdim, chans))
-        self.dec_bias3 = torch.nn.Parameter(torch.randn(xdim))
+        self.dec3 = torch.nn.Linear(hdim * chans, xdim)
+        # self.dec_weight3 = torch.nn.Parameter(torch.randn(xdim, chans))
+        # self.dec_bias3 = torch.nn.Parameter(torch.randn(xdim))
         #
         initialize_module(self, torch.nn.init.xavier_uniform_, 0)
 
@@ -204,22 +193,23 @@ class MultichanMLP(torch.nn.Module):
         x = self.enc(x)  # b, zdim
         #
         x = torch.einsum("oic,bi->boc", self.dec_weight1, x) + self.dec_bias1
-        x = F.gelu(x)  # b, hdim, c
+        x = self.activation(x)  # b, hdim, c
         #
         if self.with_1b:
             x = torch.einsum("nck,bnc->bnk", self.dec_weight1b, x)
-            x = F.gelu(x + self.dec_bias1b)  # b, hdim, c
+            x = self.activation(x + self.dec_bias1b)  # b, hdim, c
         #
-        x = torch.einsum("oic,bic->boc", self.dec_weight2, x) + self.dec_bias2
-        x = F.gelu(x)  # b, xdim, c
+        x, dst2 = self.dec2(x)
+        x = self.activation(x)  # b, xdim, c
         #
         if self.with_2b:
             x = torch.einsum("nck,bnc->bnk", self.dec_weight2b, x)
-            x = F.gelu(x + self.dec_bias2b)  # b, xdim, c
+            x = self.activation(x + self.dec_bias2b)  # b, xdim, c
         #
-        x = torch.einsum("nc,bnc->bn", self.dec_weight3, x) + self.dec_bias3
-        x = F.sigmoid(x)  # b, xdim
-        return x, []
+        x = self.dec3(x.view(len(x), -1))
+        if not self.logits:
+            x = F.sigmoid(x)  # b, xdim
+        return x
 
 
 # ##############################################################################
@@ -229,9 +219,10 @@ if __name__ == "__main__":
     DTYPE = torch.float32
     DEVICE = "cuda"  #  "cuda" if torch.cuda.is_available() else "cpu"
     FMNIST_PATH = os.path.join("datasets", "FashionMNIST")
-    BATCH_SIZE = 80  # 30
+    BATCH_SIZE = 10  # 100
     LR, MOMENTUM, WEIGHT_DECAY = 5e-4, 0, 0  #  1e-5, 0.9, 1e-4
-    NUM_EPOCHS = 70
+    NUM_EPOCHS = 3
+    LOG_EVERY = 20
 
     train_ds = torchvision.datasets.FashionMNIST(
         FMNIST_PATH,
@@ -244,8 +235,14 @@ if __name__ == "__main__":
         train_ds, batch_size=BATCH_SIZE, shuffle=True
     )
 
-    model1 = MultichanMLP(zdim=100, chans=40, hdim=300).to(DEVICE)
-    model2 = PCA_MLP(100, sigmoid_out=True).to(DEVICE)
+    model1 = MultichannelMLP(zdim=50, chans=50, hdim=350, logits=False).to(
+        DEVICE
+    )
+    # model2 = LinearMLP(50, logits=False).to(DEVICE)
+    model2 = IdempotentMultichannelMLP(
+        zdim=50, chans=50, hdim=350, logits=False, saturation=2.0
+    ).to(DEVICE)
+
     opt1 = torch.optim.Adam(
         model1.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
@@ -255,22 +252,28 @@ if __name__ == "__main__":
     bce_fn = torch.nn.BCEWithLogitsLoss()
     l1_fn = torch.nn.L1Loss()
     mse_fn = torch.nn.MSELoss()
-    loss_fn = mse_fn  # bce_fn
+    loss_fn = mse_fn
+    # loss_fn = lambda x, y: mse_fn(x, y) + 0.05 * l1_fn(x, y)
     #
     global_step = 0
     for epoch in range(NUM_EPOCHS):
+        if global_step > 200:
+            break
         for i, (imgs, targets) in enumerate(train_dl):
+            if global_step > 200:
+                break
             imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
             opt1.zero_grad()
             opt2.zero_grad()
             #
-            preds1, dists = model1(imgs.reshape(BATCH_SIZE, -1))
+            preds1 = model1(imgs.reshape(BATCH_SIZE, -1))
+            dists = []
             preds1 = preds1.reshape(imgs.shape)
             # loss = bce_fn(preds1, imgs) + 0.1 * l1_fn(preds1, imgs)
             loss = loss_fn(preds1, imgs)
             loss.backward()
             opt1.step()
-            if global_step % 200 == 0:
+            if global_step % LOG_EVERY == 0:
                 print(
                     f"{epoch}/{i}",
                     "loss:",
@@ -279,13 +282,13 @@ if __name__ == "__main__":
                     [d.item() for d in dists],
                 )
             #
-            preds2, dists = model2(imgs.reshape(BATCH_SIZE, -1))
+            preds2 = model2(imgs.reshape(BATCH_SIZE, -1))
             preds2 = preds2.reshape(imgs.shape)
             # loss = bce_fn(preds2, imgs)  # + 0.1 * l1_fn(preds2, imgs)
             loss = loss_fn(preds2, imgs)
             loss.backward()
             opt2.step()
-            if global_step % 200 == 0:
+            if global_step % LOG_EVERY == 0:
                 print(
                     "   [IDEMP]",
                     "loss:",
