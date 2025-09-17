@@ -70,7 +70,12 @@ import matplotlib.pyplot as plt
 
 from idemp.utils import gaussian_noise
 
-from idemp.models import LinearMLP, MultichannelMLP, initialize_module
+from idemp.models import (
+    LinearMLP,
+    MultichannelMLP,
+    MultichannelPipeMLP,
+    initialize_module,
+)
 
 from idemp.fftconv import circorr1d_fft, circorr2d_fft, CircularCorrelation
 from idemp.fftconv import Circorr1d, Circorr2d
@@ -219,10 +224,10 @@ if __name__ == "__main__":
     DTYPE = torch.float32
     DEVICE = "cuda"  #  "cuda" if torch.cuda.is_available() else "cpu"
     FMNIST_PATH = os.path.join("datasets", "FashionMNIST")
-    BATCH_SIZE = 10  # 100
+    BATCH_SIZE = 100  # 100
     LR, MOMENTUM, WEIGHT_DECAY = 5e-4, 0, 0  #  1e-5, 0.9, 1e-4
-    NUM_EPOCHS = 3
-    LOG_EVERY = 20
+    NUM_EPOCHS = 100
+    LOG_EVERY = 200
 
     train_ds = torchvision.datasets.FashionMNIST(
         FMNIST_PATH,
@@ -234,14 +239,14 @@ if __name__ == "__main__":
     train_dl = torch.utils.data.DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True
     )
-
-    model1 = MultichannelMLP(zdim=50, chans=50, hdim=350, logits=False).to(
-        DEVICE
-    )
-    # model2 = LinearMLP(50, logits=False).to(DEVICE)
-    model2 = IdempotentMultichannelMLP(
-        zdim=50, chans=50, hdim=350, logits=False, saturation=2.0
-    ).to(DEVICE)
+    model1 = MultichannelPipeMLP(zdim=50, logits=False).to(DEVICE)
+    model2 = LinearMLP(50, logits=False).to(DEVICE)
+    # model1 = MultichannelMLP(zdim=50, chans=50, hdim=350, logits=False).to(
+    #     DEVICE
+    # )
+    # model2 = IdempotentMultichannelMLP(
+    #     zdim=50, chans=50, hdim=350, logits=False, saturation=2.0
+    # ).to(DEVICE)
 
     opt1 = torch.optim.Adam(
         model1.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
@@ -257,11 +262,11 @@ if __name__ == "__main__":
     #
     global_step = 0
     for epoch in range(NUM_EPOCHS):
-        if global_step > 200:
-            break
+        # if global_step > 200:
+        #     break
         for i, (imgs, targets) in enumerate(train_dl):
-            if global_step > 200:
-                break
+            # if global_step > 200:
+            #     break
             imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
             opt1.zero_grad()
             opt2.zero_grad()

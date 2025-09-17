@@ -133,3 +133,81 @@ class MultichannelMLP(torch.nn.Module):
         if not self.logits:
             x = F.sigmoid(x)  # b, xdim
         return x
+
+
+class MultichannelPipeMLP(torch.nn.Module):
+    """Linear encoder with heavy multichannel decoder.
+
+    This MLP autoencoder has a simple, linear encoder and a more complex,
+    feedforward decoder that alternates pixel-layers with channel-layers:
+    * In the first decoder layer, ``hdim`` copies of the ``zdim``-dimensional
+      latent code are created, and for each copy, a linear layer is applied,
+      producing ``chans`` features.
+    * The following channel-layer contains, for each copy, a ``chan*chan``
+      linear layer that acts as channel mixer
+    * The following pixel-layer consists of a linear layer that is applied
+      to each channel idependently, mapping from any number of copies
+      (e.g. ``hdim``) to a different number of copies (e.g. 784).
+
+    Alternating channel mixers with pixel mixers allows to overfit the FMNIST
+    reconstruction task, while keeping a feedforward, linear MLP style and
+    a very simple encoder.
+    """
+
+    def __init__(
+        self,
+        zdim=50,
+        xdim=784,
+        hdim=100,
+        activation=F.gelu,
+        logits=False,
+    ):
+        """ """
+        self.activation = activation
+        self.logits = logits
+        #
+        super().__init__()
+        self.enc = torch.nn.Linear(xdim, zdim)
+        #
+        self.dec_weight1 = torch.nn.Parameter(torch.randn(hdim, zdim, hdim))
+        self.dec_bias1 = torch.nn.Parameter(torch.randn(hdim, hdim))
+        #
+        self.dec_weight2 = torch.nn.Parameter(torch.randn(hdim, hdim, hdim))
+        self.dec_bias2 = torch.nn.Parameter(torch.randn(hdim, hdim))
+        #
+        self.dec_weight3 = torch.nn.Parameter(torch.randn(hdim, hdim, hdim))
+        self.dec_bias3 = torch.nn.Parameter(torch.randn(hdim, hdim))
+        #
+        self.dec_weight4 = torch.nn.Parameter(torch.randn(hdim, hdim, hdim))
+        self.dec_bias4 = torch.nn.Parameter(torch.randn(hdim, hdim))
+        # # #
+        # self.dec_weight5 = torch.nn.Parameter(torch.randn(hdim, hdim, hdim))
+        # self.dec_bias5 = torch.nn.Parameter(torch.randn(hdim, hdim))
+        #
+        self.dec = torch.nn.Linear(hdim * hdim, xdim)
+        #
+        initialize_module(self, torch.nn.init.xavier_uniform_, 0)
+
+    def forward(self, x):
+        """ """
+        x = self.enc(x)  # b, zdim
+        # per-channel mapping
+        x = torch.einsum("oic,bi->boc", self.dec_weight1, x) + self.dec_bias1
+        x = self.activation(x)  # b, n, chans
+        #
+        x = torch.einsum("oic,bic->boc", self.dec_weight2, x) + self.dec_bias2
+        x = self.activation(x)  # b, hdim, hdim
+        #
+        x = torch.einsum("oic,bic->boc", self.dec_weight3, x) + self.dec_bias3
+        x = self.activation(x)  # b, hdim, hdim
+        #
+        x = torch.einsum("oic,bic->boc", self.dec_weight4, x) + self.dec_bias4
+        x = self.activation(x)  # b, hdim, hdim
+        # #
+        # x = torch.einsum("oic,bic->boc", self.dec_weight5, x) + self.dec_bias5
+        # x = self.activation(x)  # b, zdim, zdim
+        #
+        x = self.dec(x.reshape(len(x), -1))
+        if not self.logits:
+            x = F.sigmoid(x)  # b, xdim
+        return x
